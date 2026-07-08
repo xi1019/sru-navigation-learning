@@ -1,8 +1,11 @@
-# SRU Navigation Learning - RL Training Framework
+# Path-conditioned SRU Navigation Learning - RL Training Framework
 
-[Paper](https://arxiv.org/abs/2506.05997) | [Website](https://michaelfyang.github.io/sru-project-website/)
+[Paper](https://arxiv.org/abs/2506.05997) | [Website](https://michaelfyang.github.io/sru-project-website/) *(base SRU)*
+Paper: TODO | [Website](https://leggedrobotics.github.io/rl-path-following/) *(path conditioning, this fork)*
 
-**📌 Important Note**: This repository contains the RL training framework for the SRU navigation project, providing neural network architectures and on-policy training algorithms (PPO/MDPO). This repository does not include the simulation environments or task definitions. See the [project website](https://michaelfyang.github.io/sru-project-website/) for the complete navigation system.
+**📌 Important Note**: This repository contains the RL training framework for the SRU navigation project, providing neural network architectures and on-policy training algorithms (PPO/MDPO). This repository does not include the simulation environments or task definitions. See the [original SRU project](https://michaelfyang.github.io/sru-project-website/) for the complete base navigation system, or the [path-conditioned project](https://leggedrobotics.github.io/rl-path-following/) for the path-conditioning extension added in this fork.
+
+**🔀 Fork Notice**: This repository is a fork of [leggedrobotics/sru-navigation-learning](https://github.com/leggedrobotics/sru-navigation-learning) (Robotic Systems Lab, ETH Zurich). It adds **path conditioning** on top of the original SRU architecture: `ActorCriticSRU` can additionally be conditioned on a waypoint path, encoded by a new `PathEncoder` module and fused into the actor/critic features after the SRU. This is not part of the original paper or upstream repository — see [Path Conditioning (fork addition)](#path-conditioning-fork-addition) below, and the accompanying [project page](https://leggedrobotics.github.io/rl-path-following/) ("Path-conditioned Reinforcement Learning-based Local Planning for Long-Range Navigation", IROS 2026), for details.
 
 ## Overview
 
@@ -22,6 +25,7 @@ This framework is designed to train navigation policies that achieve 23.5% impro
 - LSTM_SRU: Core recurrent unit with spatial transformation gates
 - Cross-attention fusion module for vision + proprioception
 - 3D positional encoding for volumetric features
+- PathEncoder: waypoint-path self-attention + cross-attention pooling module (**fork addition**, see below)
 
 ✅ **RL Training Algorithms**
 - PPO (Proximal Policy Optimization)
@@ -47,19 +51,19 @@ This framework is designed to train navigation policies that achieve 23.5% impro
 
 ## What's NOT Included
 
-❌ Simulation environments (Isaac Lab tasks, maze generation, terrain)
+❌ Simulation environments (Isaac Lab tasks, maze & path generation, terrain)
 ❌ Task definitions (observation spaces, reward functions, action interfaces)
 ❌ Robot models and locomotion policies
 ❌ Depth encoder pretraining infrastructure
 
-**Note**: The simulation environment must be installed separately. See [sru-navigation-sim](https://github.com/leggedrobotics/sru-navigation-sim) for the IsaacLab extension.
+**Note**: The simulation environment must be installed separately. See [sru-navigation-sim](https://github.com/mateo-haro/path-conditioned-sim) for the IsaacLab extension.
 
 ## Architecture
 
 The repository is organized as follows:
 
 ```
-sru-navigation-learning/
+path-conditioned-rl-nav/
 ├── config/                    # Training configuration files
 │   └── dummy_config.yaml      # Example PPO configuration
 ├── rsl_rl/                    # Main Python package
@@ -75,7 +79,8 @@ sru-navigation-learning/
 │   ├── networks/              # Network components
 │   │   └── sru_memory/        # SRU memory modules
 │   │       ├── lstm_sru.py              # LSTM with SRU gating
-│   │       └── attention.py             # Cross-attention fusion with 3D positional encoding
+│   │       ├── attention.py             # Cross-attention fusion with 3D positional encoding
+│   │       └── path_encoder.py          # Waypoint-path encoder (fork addition)
 │   ├── runners/               # Training orchestration
 │   │   └── on_policy_runner.py          # Main training loop
 │   ├── storage/               # Experience replay
@@ -94,8 +99,8 @@ sru-navigation-learning/
 ### Key Components
 
 **ActorCriticSRU** ([rsl_rl/modules/actor_critic_sru.py](rsl_rl/modules/actor_critic_sru.py))
-- Dual-input architecture: depth images + proprioceptive information
-- Processing pipeline: Self-attention → Cross-attention → SRU → MLP
+- Multi-input architecture: depth images + proprioceptive information + waypoint path (**fork addition**)
+- Processing pipeline: Self-attention → Cross-attention → SRU → MLP, with the path latent fused in after the SRU, right before the MLP head
 - Separate actor and critic networks with shared depth encoder
 - Time embedding for critic value estimation
 - Supports 1-2 camera inputs with automatic padding/masking
@@ -112,18 +117,47 @@ sru-navigation-learning/
 - 3D positional encoding for spatial awareness
 - Efficient batched attention outside RNN loop
 
+**PathEncoder** ([rsl_rl/networks/sru_memory/path_encoder.py](rsl_rl/networks/sru_memory/path_encoder.py)) — **fork addition**
+- Encodes a fixed-length waypoint path (`num_waypoints` × `path_input_dim`, e.g. 15 waypoints of `[x, y, z, distance]`) into a compact latent
+- Sinusoidal positional encoding → self-attention/feed-forward block → learned-query cross-attention pooling
+- Computed in batch mode over all timesteps and concatenated onto the SRU output (bypasses the recurrent memory itself)
+- Separate instances for actor (`attn_path_net`) and critic (`attn_critic_path_net`), mirroring the existing image-attention split
+
 **Training Algorithms** ([rsl_rl/algorithms/](rsl_rl/algorithms/))
 - PPO: Standard clipped policy optimization with value loss
 - MDPO: Deep Mutual Learning with KL-divergence distillation between two networks
 - Adaptive and fixed learning rate schedules
+
+## Path Conditioning (fork addition)
+
+This fork adds waypoint-path conditioning to `ActorCriticSRU`, so the policy can use an
+externally provided route rather than relying solely on egocentric image/proprioceptive input.
+
+**New constructor arguments** on `ActorCriticSRU`:
+- `path_length` (default `60`): flattened length of the path observation (`num_waypoints * path_input_dim`)
+- `path_input_dim` (default `4`): raw features per waypoint, e.g. `[x, y, z, distance]`
+- `path_embed_dim` (default `32`): latent dimension produced by `PathEncoder`
+
+**Observation layout**: the path segment must sit immediately before the image block, i.e.
+`[proprioceptive, path, image(s)]` for the actor and `[proprioceptive, path, height, image(s), time]`
+for the critic — mirroring where image/height blocks already live at the end of the observation
+vector.
+
+**Data flow**: unlike the image/height features (fused before the SRU via cross-attention), the
+path latent bypasses the SRU entirely and is concatenated directly onto its output, right before
+the final actor/critic MLP head. This keeps the recurrent memory focused on egocentric history,
+since the path is assumed static for the episode and needs no temporal aggregation of its own.
+
+JIT (`export_jit`) and ONNX (`export_onnx`) export both include the path encoder in the exported
+graph, for all camera configurations (1 or 2 cameras).
 
 ## Installation
 
 ### Standalone Installation
 
 ```bash
-git clone https://github.com/leggedrobotics/sru-navigation-learning.git
-cd sru-navigation-learning
+git clone https://github.com/mateo-haro/path-conditioned-rl-nav.git
+cd path-conditioned-rl-nav
 
 python3 -m venv sru_nav_learning
 source sru_nav_learning/bin/activate
@@ -170,11 +204,11 @@ rm -rf _isaac_sim/kit/python/lib/python3.10/site-packages/rsl_rl
 
 # 4. Clone or place this repository
 # Option A: Clone at IsaacLab root level (recommended)
-git clone https://github.com/leggedrobotics/sru-navigation-learning.git rsl_rl
+git clone https://github.com/mateo-haro/path-conditioned-rl-nav.git rsl_rl
 
 # Option B: Clone in source/ directory
 cd source
-git clone https://github.com/leggedrobotics/sru-navigation-learning.git rsl_rl
+git clone https://github.com/mateo-haro/path-conditioned-rl-nav.git rsl_rl
 cd ..
 
 # 5. Install this SRU-enhanced version in editable mode
@@ -187,7 +221,7 @@ cd rsl_rl  # Adjust path if you placed it elsewhere
 
 **Important Notes**:
 - The package installs as `rsl_rl` (not `rsl_rl_lib`) to maintain compatibility with Isaac Lab imports
-- This repository directory can have any name (e.g., `sru-navigation-learning`, `rsl_rl`, etc.), but the installed package name will always be `rsl_rl`
+- This repository directory can have any name (e.g., `path-conditioned-rl-nav`, `rsl_rl`, etc.), but the installed package name will always be `rsl_rl`
 - The editable install (`-e`) allows you to modify the code without reinstalling
 
 **Dependencies**:
@@ -276,6 +310,10 @@ policy.export_onnx(path="./exported", filename="policy.onnx", normalizer=obs_nor
    - Provides more stable training dynamics for deep networks
    - Automatically separates hidden weights (optimized with MUON) from biases/gains (optimized with AdamW)
 
+7. **Path Conditioning** (newly added, not in original paper): A `PathEncoder` compresses an
+   externally provided waypoint path into a latent that's fused into the actor/critic features
+   after the SRU — see [Path Conditioning (fork addition)](#path-conditioning-fork-addition)
+
 ### Performance
 
 - **23.5%** improvement over standard RNNs (LSTM/GRU)
@@ -295,7 +333,7 @@ policy.export_onnx(path="./exported", filename="policy.onnx", normalizer=obs_nor
 
 ## Citation
 
-If you use this code in your research, please cite:
+If you use the base SRU architecture in your research, please cite:
 
 ```bibtex
 @article{yang2025sru,
@@ -307,6 +345,21 @@ If you use this code in your research, please cite:
   url = {https://doi.org/10.1177/02783649251401926}
 }
 ```
+
+If you use the path-conditioning extension introduced in this fork (see
+[Path Conditioning (fork addition)](#path-conditioning-fork-addition)), please also cite:
+
+```bibtex
+@inproceedings{haro2026pathconditioned,
+  title     = {Path-conditioned Reinforcement Learning-based Local Planning for Long-Range Navigation},
+  author    = {Haro, Mateo and Richter, Julia and Yang, Fan and Cadena, Cesar and Hutter, Marco},
+  booktitle = {2026 IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
+  year      = {2026},
+}
+```
+
+See the [project page](https://leggedrobotics.github.io/rl-path-following/) for details on the
+path-conditioning approach.
 
 ## Contribution Guidelines
 
@@ -330,12 +383,15 @@ pre-commit run --all-files
 
 ## Credits
 
-This repository is built upon [rsl_rl](https://github.com/leggedrobotics/rsl_rl) from ETH Zurich Robotic Systems Lab and NVIDIA.
+This repository is a fork of [sru-navigation-learning](https://github.com/leggedrobotics/sru-navigation-learning)
+(Robotic Systems Lab, ETH Zurich), which is itself built upon
+[rsl_rl](https://github.com/leggedrobotics/rsl_rl) from ETH Zurich Robotic Systems Lab and NVIDIA.
 
 **Original rsl_rl Maintainers**: David Hoeller and Nikita Rudin
 **SRU Extension**: Fan Yang
+**Path Conditioning (this fork)**: Mateo Haro
 **Affiliation**: Robotic Systems Lab, ETH Zurich
-**Contact**: fanyang1@ethz.ch
+**Contact**: maharo@ethz.ch
 
 ## License
 
