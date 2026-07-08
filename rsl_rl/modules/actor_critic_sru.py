@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
-from rsl_rl.networks.sru_memory import LSTM_SRU, CrossAttentionFuseModule
+from rsl_rl.networks.sru_memory import LSTM_SRU, CrossAttentionFuseModule, PathEncoder
 from rsl_rl.utils import unpad_trajectories
 
 
@@ -42,6 +42,9 @@ class ActorCriticSRU(nn.Module):
         rnn_num_layers: Number of RNN layers.
         time_embed_dim: Dimension of time embedding for critic.
         num_cameras: Number of cameras (1 or 2).
+        path_length: Flattened length of the path observation (num_waypoints * path_input_dim).
+        path_embed_dim: Latent dimension produced by the path encoder.
+        path_input_dim: Number of raw features per waypoint (e.g. x, y, z, distance).
     """
 
     is_recurrent = True
@@ -63,6 +66,9 @@ class ActorCriticSRU(nn.Module):
         rnn_num_layers: int = 1,
         time_embed_dim: int = 8,
         num_cameras: int = 1,
+        path_length: int = 60,
+        path_embed_dim: int = 32,
+        path_input_dim: int = 4,
         **kwargs,
     ):
         if kwargs:
@@ -88,11 +94,17 @@ class ActorCriticSRU(nn.Module):
         self.num_actor_obs = num_actor_obs
         self.num_critic_obs = num_critic_obs
 
-        # For actor: proprioceptive data + image data
-        # For critic: proprioceptive data + height data + image data + time data
-        self.actor_proprioceptive_input_dim = num_actor_obs - self.num_image_features * self.num_cameras
+        self.path_length = path_length
+        self.path_input_dim = path_input_dim
+        self.num_waypoints = path_length // path_input_dim
+
+        # For actor: proprioceptive data + path data + image data
+        # For critic: proprioceptive data + path data + height data + image data + time data
+        self.actor_proprioceptive_input_dim = (
+            num_actor_obs - self.num_image_features * self.num_cameras - path_length
+        )
         self.critic_proprioceptive_input_dim = (
-            num_critic_obs - self.num_height_features - self.num_image_features * self.num_cameras - 1
+            num_critic_obs - self.num_height_features - self.num_image_features * self.num_cameras - 1 - path_length
         )
 
         assert self.actor_proprioceptive_input_dim == self.critic_proprioceptive_input_dim, (
@@ -126,6 +138,20 @@ class ActorCriticSRU(nn.Module):
             spatial_dims=(num_cameras, image_input_dims[1], image_input_dims[2]),
         )
 
+        # Path encoders: encode the waypoint path into a latent, concatenated after the RNN.
+        self.attn_path_net = PathEncoder(
+            input_dim=path_input_dim,
+            d_model=path_embed_dim,
+            num_heads=4,
+            max_len=self.num_waypoints,
+        )
+        self.attn_critic_path_net = PathEncoder(
+            input_dim=path_input_dim,
+            d_model=path_embed_dim,
+            num_heads=4,
+            max_len=self.num_waypoints,
+        )
+
         # RNN memory modules (plain LSTM_SRU without attention)
         self.memory_a = MemorySRU(
             input_size=self.mlp_input_dim_actor,
@@ -143,7 +169,7 @@ class ActorCriticSRU(nn.Module):
 
         # Policy network (Actor)
         self.linear_dropout_actor = LinearConstDropout(
-            rnn_hidden_size, actor_hidden_dims[0], dropout_p=dropout, activation_name=activation
+            rnn_hidden_size + path_embed_dim, actor_hidden_dims[0], dropout_p=dropout, activation_name=activation
         )
         actor_layers = []
         for layer_index in range(len(actor_hidden_dims)):
@@ -156,7 +182,10 @@ class ActorCriticSRU(nn.Module):
 
         # Value network (Critic)
         self.linear_dropout_critic = LinearConstDropout(
-            rnn_hidden_size + time_embed_dim, critic_hidden_dims[0], dropout_p=dropout, activation_name=activation
+            rnn_hidden_size + path_embed_dim + time_embed_dim,
+            critic_hidden_dims[0],
+            dropout_p=dropout,
+            activation_name=activation,
         )
         critic_layers = []
         for layer_index in range(len(critic_hidden_dims)):
@@ -172,6 +201,7 @@ class ActorCriticSRU(nn.Module):
         print(f"[ActorCriticSRU] Actor RNN: {self.memory_a}")
         print(f"[ActorCriticSRU] Critic RNN: {self.memory_c}")
         print(f"[ActorCriticSRU] Num cameras: {self.num_cameras}")
+        print(f"[ActorCriticSRU] Path encoder: {self.attn_path_net}")
         # Action noise: using log_std parameter
         self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
         self.distribution = None
@@ -180,6 +210,7 @@ class ActorCriticSRU(nn.Module):
     def get_actor_parameters(self):
         return (
             list(self.attn_image_net.parameters())
+            + list(self.attn_path_net.parameters())
             + list(self.linear_dropout_actor.parameters())
             + list(self.actor.parameters())
             + list(self.memory_a.parameters())
@@ -190,6 +221,7 @@ class ActorCriticSRU(nn.Module):
         return (
             list(self.attn_height_net.parameters())
             + list(self.attn_critic_image_net.parameters())
+            + list(self.attn_critic_path_net.parameters())
             + list(self.linear_dropout_critic.parameters())
             + list(self.time_layer.parameters())
             + list(self.critic.parameters())
@@ -245,6 +277,26 @@ class ActorCriticSRU(nn.Module):
         else:
             raise ValueError(f"Unsupported num_cameras: {self.num_cameras}")
 
+    def _encode_path(self, path_net: PathEncoder, path_obs: torch.Tensor, batch_mode: bool, masks) -> torch.Tensor:
+        """Encode a (possibly batched-over-time) path observation into a latent vector.
+
+        Args:
+            path_net: The PathEncoder instance to use (actor or critic).
+            path_obs: Path observations, shape (B, path_length) or (L, B, path_length).
+            batch_mode: Whether processing a padded trajectory batch.
+            masks: Mask tensor for batch mode (None for inference).
+
+        Returns:
+            Path latent, shape (B, path_embed_dim) or unpadded (N, path_embed_dim).
+        """
+        leading_dims = path_obs.shape[:2]
+        flat_path = path_obs.reshape(-1, self.num_waypoints, self.path_input_dim)
+        path_embed = path_net(flat_path)
+        if batch_mode:
+            path_embed = path_embed.view(*leading_dims, -1)
+            path_embed = unpad_trajectories(path_embed, masks)
+        return path_embed
+
     def process_actor_input(self, observations: torch.Tensor, masks, hidden_states) -> torch.Tensor:
         """Process actor observations through attention and RNN.
 
@@ -261,9 +313,13 @@ class ActorCriticSRU(nn.Module):
         """
         batch_mode = masks is not None
 
-        # Split observations into proprioceptive and image parts
+        # Split observations into proprioceptive, path, and image parts
+        # Layout: [proprioceptive, path, image(s)]
         other_obs = observations[..., : -self.num_image_features * self.num_cameras]
         image_list = self._extract_image_observations(observations)
+
+        path_obs = other_obs[..., -self.path_length :]
+        other_obs = other_obs[..., : -self.path_length]
         other_obs = other_obs.reshape(-1, self.actor_proprioceptive_input_dim)
 
         # Stack images if multiple cameras, otherwise use single image
@@ -286,8 +342,12 @@ class ActorCriticSRU(nn.Module):
 
         # RNN processing
         combined_features = self.memory_a(combined_features, masks, hidden_states)
+        combined_features = combined_features.squeeze(0)
 
-        return combined_features.squeeze(0)
+        # Path encoding bypasses the RNN and is concatenated onto its output
+        path_embed = self._encode_path(self.attn_path_net, path_obs, batch_mode, masks)
+
+        return torch.cat([combined_features, path_embed], dim=-1)
 
     def process_critic_input(self, observations: torch.Tensor, masks, hidden_states) -> torch.Tensor:
         """Process critic observations through attention and RNN.
@@ -309,11 +369,15 @@ class ActorCriticSRU(nn.Module):
         time_offset = self.num_height_features + self.num_image_features * self.num_cameras + 1
         height_start = self.num_image_features * self.num_cameras
 
-        # Split observations into proprioceptive, time, height, and image parts
+        # Split observations into proprioceptive, path, time, height, and image parts
+        # Layout: [proprioceptive, path, height, image(s), time]
         other_obs = observations[..., :-time_offset]
         time_obs = observations[..., -time_offset].unsqueeze(-1)
         height_obs = observations[..., -(height_start + self.num_height_features) : -height_start]
         image_list = self._extract_image_observations(observations)
+
+        path_obs = other_obs[..., -self.path_length :]
+        other_obs = other_obs[..., : -self.path_length]
 
         # Reshape tensors
         other_obs = other_obs.reshape(-1, self.critic_proprioceptive_input_dim)
@@ -344,12 +408,16 @@ class ActorCriticSRU(nn.Module):
 
         # RNN processing
         combined_features = self.memory_c(combined_features, masks, hidden_states)
+        combined_features = combined_features.squeeze(0)
 
         if batch_mode:
             time_embed = unpad_trajectories(time_embed, masks)
 
-        # Concatenate time embedding with combined features
-        return torch.cat([combined_features.squeeze(0), time_embed], dim=-1)
+        # Path encoding bypasses the RNN and is concatenated onto its output
+        path_embed = self._encode_path(self.attn_critic_path_net, path_obs, batch_mode, masks)
+
+        # Concatenate path and time embeddings with combined features
+        return torch.cat([combined_features, path_embed, time_embed], dim=-1)
 
     def update_distribution(self, combined_features):
         """Update the action distribution based on actor output."""
@@ -415,23 +483,31 @@ class ActorCriticSRU(nn.Module):
         if self.num_cameras == 2:
             exporter = _ActorCriticSRUExporterDualCam(
                 attn_image_net=self.attn_image_net,
+                attn_path_net=self.attn_path_net,
                 memory_a=self.memory_a,
                 linear_dropout_actor=self.linear_dropout_actor,
                 actor=self.actor,
                 image_input_dims=self.image_input_dims,
                 num_image_features=self.num_image_features,
                 actor_proprioceptive_input_dim=self.actor_proprioceptive_input_dim,
+                path_length=self.path_length,
+                num_waypoints=self.num_waypoints,
+                path_input_dim=self.path_input_dim,
                 normalizer=normalizer,
             )
         else:
             exporter = _ActorCriticSRUExporterSingleCam(
                 attn_image_net=self.attn_image_net,
+                attn_path_net=self.attn_path_net,
                 memory_a=self.memory_a,
                 linear_dropout_actor=self.linear_dropout_actor,
                 actor=self.actor,
                 image_input_dims=self.image_input_dims,
                 num_image_features=self.num_image_features,
                 actor_proprioceptive_input_dim=self.actor_proprioceptive_input_dim,
+                path_length=self.path_length,
+                num_waypoints=self.num_waypoints,
+                path_input_dim=self.path_input_dim,
                 normalizer=normalizer,
             )
 
@@ -478,23 +554,31 @@ class ActorCriticSRU(nn.Module):
         if self.num_cameras == 2:
             exporter = _ActorCriticSRUONNXExporterDualCam(
                 attn_image_net=self.attn_image_net,
+                attn_path_net=self.attn_path_net,
                 memory_a=self.memory_a,
                 linear_dropout_actor=self.linear_dropout_actor,
                 actor=self.actor,
                 image_input_dims=self.image_input_dims,
                 num_image_features=self.num_image_features,
                 actor_proprioceptive_input_dim=self.actor_proprioceptive_input_dim,
+                path_length=self.path_length,
+                num_waypoints=self.num_waypoints,
+                path_input_dim=self.path_input_dim,
                 normalizer=normalizer,
             )
         else:
             exporter = _ActorCriticSRUONNXExporterSingleCam(
                 attn_image_net=self.attn_image_net,
+                attn_path_net=self.attn_path_net,
                 memory_a=self.memory_a,
                 linear_dropout_actor=self.linear_dropout_actor,
                 actor=self.actor,
                 image_input_dims=self.image_input_dims,
                 num_image_features=self.num_image_features,
                 actor_proprioceptive_input_dim=self.actor_proprioceptive_input_dim,
+                path_length=self.path_length,
+                num_waypoints=self.num_waypoints,
+                path_input_dim=self.path_input_dim,
                 normalizer=normalizer,
             )
 
@@ -543,23 +627,31 @@ class ActorCriticSRU(nn.Module):
 class _ActorCriticSRUExporterSingleCam(nn.Module):
     """JIT-exportable wrapper for ActorCriticSRU with single camera (optimized)."""
 
-    __constants__ = ['num_image_features', 'actor_proprioceptive_input_dim', 'image_c', 'image_h', 'image_w']
+    __constants__ = [
+        'num_image_features', 'actor_proprioceptive_input_dim', 'image_c', 'image_h', 'image_w',
+        'path_length', 'num_waypoints', 'path_input_dim',
+    ]
 
     def __init__(
         self,
         attn_image_net,
+        attn_path_net,
         memory_a,
         linear_dropout_actor,
         actor,
         image_input_dims: tuple,
         num_image_features: int,
         actor_proprioceptive_input_dim: int,
+        path_length: int,
+        num_waypoints: int,
+        path_input_dim: int,
         normalizer=None,
     ):
         super().__init__()
         import copy
 
         self.attn_image_net = copy.deepcopy(attn_image_net)
+        self.attn_path_net = copy.deepcopy(attn_path_net)
         self.rnn = copy.deepcopy(memory_a.rnn)
         self.linear = copy.deepcopy(linear_dropout_actor.linear)
         self.activation = copy.deepcopy(linear_dropout_actor.activation)
@@ -572,6 +664,9 @@ class _ActorCriticSRUExporterSingleCam(nn.Module):
         self.image_c = image_input_dims[0]
         self.image_h = image_input_dims[1]
         self.image_w = image_input_dims[2]
+        self.path_length = path_length
+        self.num_waypoints = num_waypoints
+        self.path_input_dim = path_input_dim
 
         # Register hidden state buffers for LSTM_SRU
         self.register_buffer(
@@ -591,8 +686,10 @@ class _ActorCriticSRUExporterSingleCam(nn.Module):
 
         observations = self.normalizer(observations)
 
-        # Split observations into proprioceptive and image parts
+        # Split observations into proprioceptive, path, and image parts
         other_obs = observations[..., :-self.num_image_features]
+        path_obs = other_obs[..., -self.path_length:]
+        other_obs = other_obs[..., :-self.path_length]
         other_obs = other_obs.reshape(-1, self.actor_proprioceptive_input_dim)
 
         # Extract and reshape single camera image
@@ -615,6 +712,11 @@ class _ActorCriticSRUExporterSingleCam(nn.Module):
 
         combined_features = combined_features.squeeze(0)
 
+        # Path encoding, concatenated onto the RNN output
+        path_obs = path_obs.reshape(-1, self.num_waypoints, self.path_input_dim)
+        path_embed = self.attn_path_net(path_obs)
+        combined_features = torch.cat([combined_features, path_embed], dim=-1)
+
         # Linear + activation (no dropout during inference)
         combined_features = self.activation(self.linear(combined_features))
 
@@ -631,23 +733,31 @@ class _ActorCriticSRUExporterSingleCam(nn.Module):
 class _ActorCriticSRUExporterDualCam(nn.Module):
     """JIT-exportable wrapper for ActorCriticSRU with dual cameras (optimized)."""
 
-    __constants__ = ['num_image_features', 'actor_proprioceptive_input_dim', 'image_c', 'image_h', 'image_w']
+    __constants__ = [
+        'num_image_features', 'actor_proprioceptive_input_dim', 'image_c', 'image_h', 'image_w',
+        'path_length', 'num_waypoints', 'path_input_dim',
+    ]
 
     def __init__(
         self,
         attn_image_net,
+        attn_path_net,
         memory_a,
         linear_dropout_actor,
         actor,
         image_input_dims: tuple,
         num_image_features: int,
         actor_proprioceptive_input_dim: int,
+        path_length: int,
+        num_waypoints: int,
+        path_input_dim: int,
         normalizer=None,
     ):
         super().__init__()
         import copy
 
         self.attn_image_net = copy.deepcopy(attn_image_net)
+        self.attn_path_net = copy.deepcopy(attn_path_net)
         self.rnn = copy.deepcopy(memory_a.rnn)
         self.linear = copy.deepcopy(linear_dropout_actor.linear)
         self.activation = copy.deepcopy(linear_dropout_actor.activation)
@@ -660,6 +770,9 @@ class _ActorCriticSRUExporterDualCam(nn.Module):
         self.image_c = image_input_dims[0]
         self.image_h = image_input_dims[1]
         self.image_w = image_input_dims[2]
+        self.path_length = path_length
+        self.num_waypoints = num_waypoints
+        self.path_input_dim = path_input_dim
 
         # Register hidden state buffers for LSTM_SRU
         self.register_buffer(
@@ -679,8 +792,10 @@ class _ActorCriticSRUExporterDualCam(nn.Module):
 
         observations = self.normalizer(observations)
 
-        # Split observations into proprioceptive and image parts (2 cameras)
+        # Split observations into proprioceptive, path, and image parts (2 cameras)
         other_obs = observations[..., :-self.num_image_features * 2]
+        path_obs = other_obs[..., -self.path_length:]
+        other_obs = other_obs[..., :-self.path_length]
         other_obs = other_obs.reshape(-1, self.actor_proprioceptive_input_dim)
 
         # Extract and reshape dual camera images
@@ -706,6 +821,11 @@ class _ActorCriticSRUExporterDualCam(nn.Module):
         self.cell_state[:] = c
 
         combined_features = combined_features.squeeze(0)
+
+        # Path encoding, concatenated onto the RNN output
+        path_obs = path_obs.reshape(-1, self.num_waypoints, self.path_input_dim)
+        path_embed = self.attn_path_net(path_obs)
+        combined_features = torch.cat([combined_features, path_embed], dim=-1)
 
         # Linear + activation (no dropout during inference)
         combined_features = self.activation(self.linear(combined_features))
@@ -872,18 +992,23 @@ class _ActorCriticSRUONNXExporterSingleCam(nn.Module):
     def __init__(
         self,
         attn_image_net,
+        attn_path_net,
         memory_a,
         linear_dropout_actor,
         actor,
         image_input_dims: tuple,
         num_image_features: int,
         actor_proprioceptive_input_dim: int,
+        path_length: int,
+        num_waypoints: int,
+        path_input_dim: int,
         normalizer=None,
     ):
         super().__init__()
         import copy
 
         self.attn_image_net = copy.deepcopy(attn_image_net)
+        self.attn_path_net = copy.deepcopy(attn_path_net)
         self.rnn = copy.deepcopy(memory_a.rnn)
         self.linear = copy.deepcopy(linear_dropout_actor.linear)
         self.activation = copy.deepcopy(linear_dropout_actor.activation)
@@ -896,6 +1021,9 @@ class _ActorCriticSRUONNXExporterSingleCam(nn.Module):
         self.image_c = image_input_dims[0]
         self.image_h = image_input_dims[1]
         self.image_w = image_input_dims[2]
+        self.path_length = path_length
+        self.num_waypoints = num_waypoints
+        self.path_input_dim = path_input_dim
 
     def forward(
         self, observations: torch.Tensor, hidden_state: torch.Tensor, cell_state: torch.Tensor
@@ -903,8 +1031,10 @@ class _ActorCriticSRUONNXExporterSingleCam(nn.Module):
         """Forward pass with explicit hidden state I/O."""
         observations = self.normalizer(observations)
 
-        # Split observations into proprioceptive and image parts
+        # Split observations into proprioceptive, path, and image parts
         other_obs = observations[..., :-self.num_image_features]
+        path_obs = other_obs[..., -self.path_length:]
+        other_obs = other_obs[..., :-self.path_length]
         other_obs = other_obs.reshape(-1, self.actor_proprioceptive_input_dim)
 
         # Extract and reshape single camera image, add depth dimension
@@ -925,6 +1055,11 @@ class _ActorCriticSRUONNXExporterSingleCam(nn.Module):
         )
         combined_features = combined_features.squeeze(0)
 
+        # Path encoding, concatenated onto the RNN output
+        path_obs = path_obs.reshape(-1, self.num_waypoints, self.path_input_dim)
+        path_embed = self.attn_path_net(path_obs)
+        combined_features = torch.cat([combined_features, path_embed], dim=-1)
+
         # Linear + activation (no dropout during inference)
         combined_features = self.activation(self.linear(combined_features))
 
@@ -943,18 +1078,23 @@ class _ActorCriticSRUONNXExporterDualCam(nn.Module):
     def __init__(
         self,
         attn_image_net,
+        attn_path_net,
         memory_a,
         linear_dropout_actor,
         actor,
         image_input_dims: tuple,
         num_image_features: int,
         actor_proprioceptive_input_dim: int,
+        path_length: int,
+        num_waypoints: int,
+        path_input_dim: int,
         normalizer=None,
     ):
         super().__init__()
         import copy
 
         self.attn_image_net = copy.deepcopy(attn_image_net)
+        self.attn_path_net = copy.deepcopy(attn_path_net)
         self.rnn = copy.deepcopy(memory_a.rnn)
         self.linear = copy.deepcopy(linear_dropout_actor.linear)
         self.activation = copy.deepcopy(linear_dropout_actor.activation)
@@ -967,6 +1107,9 @@ class _ActorCriticSRUONNXExporterDualCam(nn.Module):
         self.image_c = image_input_dims[0]
         self.image_h = image_input_dims[1]
         self.image_w = image_input_dims[2]
+        self.path_length = path_length
+        self.num_waypoints = num_waypoints
+        self.path_input_dim = path_input_dim
 
     def forward(
         self, observations: torch.Tensor, hidden_state: torch.Tensor, cell_state: torch.Tensor
@@ -974,8 +1117,10 @@ class _ActorCriticSRUONNXExporterDualCam(nn.Module):
         """Forward pass with explicit hidden state I/O."""
         observations = self.normalizer(observations)
 
-        # Split observations into proprioceptive and image parts (2 cameras)
+        # Split observations into proprioceptive, path, and image parts (2 cameras)
         other_obs = observations[..., :-self.num_image_features * 2]
+        path_obs = other_obs[..., -self.path_length:]
+        other_obs = other_obs[..., :-self.path_length]
         other_obs = other_obs.reshape(-1, self.actor_proprioceptive_input_dim)
 
         # Extract and reshape dual camera images, then stack along depth dimension
@@ -998,6 +1143,11 @@ class _ActorCriticSRUONNXExporterDualCam(nn.Module):
             (hidden_state, cell_state)
         )
         combined_features = combined_features.squeeze(0)
+
+        # Path encoding, concatenated onto the RNN output
+        path_obs = path_obs.reshape(-1, self.num_waypoints, self.path_input_dim)
+        path_embed = self.attn_path_net(path_obs)
+        combined_features = torch.cat([combined_features, path_embed], dim=-1)
 
         # Linear + activation (no dropout during inference)
         combined_features = self.activation(self.linear(combined_features))

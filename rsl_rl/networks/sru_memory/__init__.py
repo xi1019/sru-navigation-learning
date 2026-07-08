@@ -6,9 +6,11 @@
 
 from .attention import CrossAttentionFuseModule
 from .lstm_sru import LSTM_SRU, LSTMSRUCell
+from .path_encoder import PathEncoder
 
 __all__ = [
     "LSTM_SRU",
     "LSTMSRUCell",
     "CrossAttentionFuseModule",
+    "PathEncoder",
 ]

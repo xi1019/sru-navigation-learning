@@ -8,10 +8,12 @@ from .sru_memory import (
     LSTM_SRU,
     LSTMSRUCell,
     CrossAttentionFuseModule,
+    PathEncoder,
 )
 
 __all__ = [
     "LSTM_SRU",
     "LSTMSRUCell",
     "CrossAttentionFuseModule",
+    "PathEncoder",
 ]
