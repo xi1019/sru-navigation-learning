@@ -45,6 +45,7 @@ class ActorCriticSRU(nn.Module):
         path_length: Flattened length of the path observation (num_waypoints * path_input_dim).
         path_embed_dim: Latent dimension produced by the path encoder.
         path_input_dim: Number of raw features per waypoint (e.g. x, y, z, distance).
+        path_query_mode: Actor path query source ('learned' or 'memory').
     """
 
     is_recurrent = True
@@ -69,6 +70,7 @@ class ActorCriticSRU(nn.Module):
         path_length: int = 60,
         path_embed_dim: int = 32,
         path_input_dim: int = 4,
+        path_query_mode: str = "learned",
         **kwargs,
     ):
         if kwargs:
@@ -76,6 +78,9 @@ class ActorCriticSRU(nn.Module):
         if rnn_type != "lstm_sru":
             print(f"[ActorCriticSRU] Warning: rnn_type='{rnn_type}' is ignored. ActorCriticSRU always uses LSTM_SRU.")
         super().__init__()
+        if path_query_mode not in ("learned", "memory"):
+            raise ValueError(f"Unsupported path_query_mode: {path_query_mode!r}")
+        self.path_query_mode = path_query_mode
 
         # Handle mutable default arguments
         if actor_hidden_dims is None:
@@ -206,16 +211,33 @@ class ActorCriticSRU(nn.Module):
         self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
         self.distribution = None
         Normal.set_default_validate_args(False)
+        # Create only for M1, preserving baseline parameters and initialization.
+        self.actor_memory_to_path_query = (
+            nn.Linear(rnn_hidden_size, path_embed_dim) if path_query_mode == "memory" else None
+        )
 
     def get_actor_parameters(self):
+        path_parameters = [
+            parameter for parameter in self.attn_path_net.parameters()
+            if self.path_query_mode != "memory" or parameter is not self.attn_path_net.latent_query
+        ]
         return (
             list(self.attn_image_net.parameters())
-            + list(self.attn_path_net.parameters())
+            + path_parameters
             + list(self.linear_dropout_actor.parameters())
             + list(self.actor.parameters())
             + list(self.memory_a.parameters())
+            + (list(self.actor_memory_to_path_query.parameters()) if self.actor_memory_to_path_query is not None else [])
             + [self.log_std]
         )
+
+    def parameters(self, recurse: bool = True):
+        # PPO/MDPO construct their optimizers from this iterator, rather than
+        # get_actor_parameters(). Keep the inactive query registered for loading.
+        for parameter in super().parameters(recurse=recurse):
+            if self.path_query_mode == "memory" and parameter is self.attn_path_net.latent_query:
+                continue
+            yield parameter
 
     def get_critic_parameters(self):
         return (
@@ -277,7 +299,14 @@ class ActorCriticSRU(nn.Module):
         else:
             raise ValueError(f"Unsupported num_cameras: {self.num_cameras}")
 
-    def _encode_path(self, path_net: PathEncoder, path_obs: torch.Tensor, batch_mode: bool, masks) -> torch.Tensor:
+    def _encode_path(
+        self,
+        path_net: PathEncoder,
+        path_obs: torch.Tensor,
+        batch_mode: bool,
+        masks,
+        query: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Encode a (possibly batched-over-time) path observation into a latent vector.
 
         Args:
@@ -285,10 +314,21 @@ class ActorCriticSRU(nn.Module):
             path_obs: Path observations, shape (B, path_length) or (L, B, path_length).
             batch_mode: Whether processing a padded trajectory batch.
             masks: Mask tensor for batch mode (None for inference).
+            query: External query, already in the same unpadded order as SRU output.
 
         Returns:
-            Path latent, shape (B, path_embed_dim) or unpadded (N, path_embed_dim).
+            Path latent, shape (B, path_embed_dim) for inference or
+            (L, num_envs, path_embed_dim) in restored rollout order for batch mode.
         """
+        if query is not None:
+            if batch_mode:
+                # MemorySRU has already restored rollout order. Apply exactly the
+                # same mask/unpad to paths before pairing each timestep with h_t.
+                path_obs = unpad_trajectories(path_obs, masks).squeeze(0)
+            flat_path = path_obs.reshape(-1, self.num_waypoints, self.path_input_dim)
+            path_embed = path_net(flat_path, query.reshape(-1, query.shape[-1]))
+            return path_embed.reshape(query.shape)
+
         leading_dims = path_obs.shape[:2]
         flat_path = path_obs.reshape(-1, self.num_waypoints, self.path_input_dim)
         path_embed = path_net(flat_path)
@@ -345,7 +385,10 @@ class ActorCriticSRU(nn.Module):
         combined_features = combined_features.squeeze(0)
 
         # Path encoding bypasses the RNN and is concatenated onto its output
-        path_embed = self._encode_path(self.attn_path_net, path_obs, batch_mode, masks)
+        query = None
+        if self.actor_memory_to_path_query is not None:
+            query = self.actor_memory_to_path_query(combined_features)
+        path_embed = self._encode_path(self.attn_path_net, path_obs, batch_mode, masks, query)
 
         return torch.cat([combined_features, path_embed], dim=-1)
 
@@ -494,6 +537,7 @@ class ActorCriticSRU(nn.Module):
                 num_waypoints=self.num_waypoints,
                 path_input_dim=self.path_input_dim,
                 normalizer=normalizer,
+                actor_memory_to_path_query=self.actor_memory_to_path_query,
             )
         else:
             exporter = _ActorCriticSRUExporterSingleCam(
@@ -509,6 +553,7 @@ class ActorCriticSRU(nn.Module):
                 num_waypoints=self.num_waypoints,
                 path_input_dim=self.path_input_dim,
                 normalizer=normalizer,
+                actor_memory_to_path_query=self.actor_memory_to_path_query,
             )
 
         exporter.eval()
@@ -565,6 +610,7 @@ class ActorCriticSRU(nn.Module):
                 num_waypoints=self.num_waypoints,
                 path_input_dim=self.path_input_dim,
                 normalizer=normalizer,
+                actor_memory_to_path_query=self.actor_memory_to_path_query,
             )
         else:
             exporter = _ActorCriticSRUONNXExporterSingleCam(
@@ -580,6 +626,7 @@ class ActorCriticSRU(nn.Module):
                 num_waypoints=self.num_waypoints,
                 path_input_dim=self.path_input_dim,
                 normalizer=normalizer,
+                actor_memory_to_path_query=self.actor_memory_to_path_query,
             )
 
         exporter.eval()
@@ -646,12 +693,14 @@ class _ActorCriticSRUExporterSingleCam(nn.Module):
         num_waypoints: int,
         path_input_dim: int,
         normalizer=None,
+        actor_memory_to_path_query=None,
     ):
         super().__init__()
         import copy
 
         self.attn_image_net = copy.deepcopy(attn_image_net)
         self.attn_path_net = copy.deepcopy(attn_path_net)
+        self.actor_memory_to_path_query = copy.deepcopy(actor_memory_to_path_query)
         self.rnn = copy.deepcopy(memory_a.rnn)
         self.linear = copy.deepcopy(linear_dropout_actor.linear)
         self.activation = copy.deepcopy(linear_dropout_actor.activation)
@@ -714,7 +763,10 @@ class _ActorCriticSRUExporterSingleCam(nn.Module):
 
         # Path encoding, concatenated onto the RNN output
         path_obs = path_obs.reshape(-1, self.num_waypoints, self.path_input_dim)
-        path_embed = self.attn_path_net(path_obs)
+        query = None
+        if self.actor_memory_to_path_query is not None:
+            query = self.actor_memory_to_path_query(combined_features)
+        path_embed = self.attn_path_net(path_obs, query)
         combined_features = torch.cat([combined_features, path_embed], dim=-1)
 
         # Linear + activation (no dropout during inference)
@@ -752,12 +804,14 @@ class _ActorCriticSRUExporterDualCam(nn.Module):
         num_waypoints: int,
         path_input_dim: int,
         normalizer=None,
+        actor_memory_to_path_query=None,
     ):
         super().__init__()
         import copy
 
         self.attn_image_net = copy.deepcopy(attn_image_net)
         self.attn_path_net = copy.deepcopy(attn_path_net)
+        self.actor_memory_to_path_query = copy.deepcopy(actor_memory_to_path_query)
         self.rnn = copy.deepcopy(memory_a.rnn)
         self.linear = copy.deepcopy(linear_dropout_actor.linear)
         self.activation = copy.deepcopy(linear_dropout_actor.activation)
@@ -824,7 +878,10 @@ class _ActorCriticSRUExporterDualCam(nn.Module):
 
         # Path encoding, concatenated onto the RNN output
         path_obs = path_obs.reshape(-1, self.num_waypoints, self.path_input_dim)
-        path_embed = self.attn_path_net(path_obs)
+        query = None
+        if self.actor_memory_to_path_query is not None:
+            query = self.actor_memory_to_path_query(combined_features)
+        path_embed = self.attn_path_net(path_obs, query)
         combined_features = torch.cat([combined_features, path_embed], dim=-1)
 
         # Linear + activation (no dropout during inference)
@@ -1003,12 +1060,14 @@ class _ActorCriticSRUONNXExporterSingleCam(nn.Module):
         num_waypoints: int,
         path_input_dim: int,
         normalizer=None,
+        actor_memory_to_path_query=None,
     ):
         super().__init__()
         import copy
 
         self.attn_image_net = copy.deepcopy(attn_image_net)
         self.attn_path_net = copy.deepcopy(attn_path_net)
+        self.actor_memory_to_path_query = copy.deepcopy(actor_memory_to_path_query)
         self.rnn = copy.deepcopy(memory_a.rnn)
         self.linear = copy.deepcopy(linear_dropout_actor.linear)
         self.activation = copy.deepcopy(linear_dropout_actor.activation)
@@ -1057,7 +1116,10 @@ class _ActorCriticSRUONNXExporterSingleCam(nn.Module):
 
         # Path encoding, concatenated onto the RNN output
         path_obs = path_obs.reshape(-1, self.num_waypoints, self.path_input_dim)
-        path_embed = self.attn_path_net(path_obs)
+        query = None
+        if self.actor_memory_to_path_query is not None:
+            query = self.actor_memory_to_path_query(combined_features)
+        path_embed = self.attn_path_net(path_obs, query)
         combined_features = torch.cat([combined_features, path_embed], dim=-1)
 
         # Linear + activation (no dropout during inference)
@@ -1089,12 +1151,14 @@ class _ActorCriticSRUONNXExporterDualCam(nn.Module):
         num_waypoints: int,
         path_input_dim: int,
         normalizer=None,
+        actor_memory_to_path_query=None,
     ):
         super().__init__()
         import copy
 
         self.attn_image_net = copy.deepcopy(attn_image_net)
         self.attn_path_net = copy.deepcopy(attn_path_net)
+        self.actor_memory_to_path_query = copy.deepcopy(actor_memory_to_path_query)
         self.rnn = copy.deepcopy(memory_a.rnn)
         self.linear = copy.deepcopy(linear_dropout_actor.linear)
         self.activation = copy.deepcopy(linear_dropout_actor.activation)
@@ -1146,7 +1210,10 @@ class _ActorCriticSRUONNXExporterDualCam(nn.Module):
 
         # Path encoding, concatenated onto the RNN output
         path_obs = path_obs.reshape(-1, self.num_waypoints, self.path_input_dim)
-        path_embed = self.attn_path_net(path_obs)
+        query = None
+        if self.actor_memory_to_path_query is not None:
+            query = self.actor_memory_to_path_query(combined_features)
+        path_embed = self.attn_path_net(path_obs, query)
         combined_features = torch.cat([combined_features, path_embed], dim=-1)
 
         # Linear + activation (no dropout during inference)

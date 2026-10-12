@@ -4,6 +4,7 @@
 """Path-encoding module for compressing a sequence of waypoints into a latent vector."""
 
 import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -72,10 +73,12 @@ class PathEncoder(nn.Module):
         self.latent_query = nn.Parameter(torch.randn(d_model))
         self.cross_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, batch_first=True)
 
-    def forward(self, path: torch.Tensor) -> torch.Tensor:
+    def forward(self, path: torch.Tensor, query: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             path: Tensor of shape (B, max_len, input_dim)
+            query: Optional external query of shape (B, d_model).
+                None uses the original learned query.
 
         Returns:
             Latent vector of shape (B, d_model)
@@ -92,6 +95,9 @@ class PathEncoder(nn.Module):
         x = self.norm2(x)
         x = residual + self.ffn(x)
 
-        q = self.latent_query.unsqueeze(0).expand(path.size(0), -1).unsqueeze(1)
+        if query is None:
+            q = self.latent_query.unsqueeze(0).expand(path.size(0), -1).unsqueeze(1)
+        else:
+            q = query.unsqueeze(1)
         latent, _ = self.cross_attn(q, x, x, need_weights=False)
         return latent.squeeze(1)
